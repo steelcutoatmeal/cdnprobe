@@ -11,22 +11,30 @@ import time as _time
 import click
 
 from cdnprobe import __version__
-from cdnprobe.config import DEFAULT_DELAY_MS, DEFAULT_MAX_HOPS, DEFAULT_SAMPLES, DEFAULT_TIMEOUT, DEFAULT_WARMUP
+from cdnprobe.config import (
+    DEFAULT_CONCURRENCY,
+    DEFAULT_DELAY_MS,
+    DEFAULT_MAX_HOPS,
+    DEFAULT_SAMPLES,
+    DEFAULT_TIMEOUT,
+    DEFAULT_WARMUP,
+)
 from cdnprobe.models import FullResult, MeasurementConfig
 
 
 @click.command()
 @click.option("-p", "--providers", default="", help="Comma-separated providers [default: all]")
-@click.option("-n", "--samples", default=DEFAULT_SAMPLES, help="Samples per provider", show_default=True)
-@click.option("-w", "--warmup", default=DEFAULT_WARMUP, help="Warmup requests (discarded)", show_default=True)
+@click.option("-n", "--samples", default=DEFAULT_SAMPLES, type=click.IntRange(min=1), help="Samples per provider", show_default=True)
+@click.option("-w", "--warmup", default=DEFAULT_WARMUP, type=click.IntRange(min=0), help="Warmup requests (discarded)", show_default=True)
 @click.option("--no-warmup", is_flag=True, help="Disable warmup")
-@click.option("-d", "--delay", default=DEFAULT_DELAY_MS, help="Inter-sample delay in ms", show_default=True)
-@click.option("-t", "--timeout", default=DEFAULT_TIMEOUT, help="Request timeout in seconds", show_default=True)
+@click.option("-d", "--delay", default=DEFAULT_DELAY_MS, type=click.IntRange(min=0), help="Inter-sample delay in ms", show_default=True)
+@click.option("-t", "--timeout", default=DEFAULT_TIMEOUT, type=click.FloatRange(min=0.1), help="Request timeout in seconds", show_default=True)
 @click.option("--dns-server", default=None, help="Custom DNS server (e.g., 8.8.8.8)")
 @click.option("-4", "--ipv4-only", is_flag=True, help="Force IPv4")
 @click.option("-6", "--ipv6-only", is_flag=True, help="Force IPv6")
 @click.option("--trace/--no-trace", default=True, help="Enable/disable network path tracing", show_default=True)
-@click.option("--max-hops", default=DEFAULT_MAX_HOPS, help="Max hops for traceroute", show_default=True)
+@click.option("--max-hops", default=DEFAULT_MAX_HOPS, type=click.IntRange(min=1, max=64), help="Max hops for traceroute", show_default=True)
+@click.option("-c", "--concurrency", default=DEFAULT_CONCURRENCY, type=click.IntRange(min=1), help="Providers measured at the same time", show_default=True)
 @click.option("--json", "json_output", is_flag=True, help="Output JSON to stdout")
 @click.option("--csv", "csv_output", is_flag=True, help="Output CSV to stdout")
 @click.option("-o", "--output", default=None, help="Write results to file")
@@ -35,8 +43,8 @@ from cdnprobe.models import FullResult, MeasurementConfig
 @click.option("--no-geo", is_flag=True, help="Skip geolocation lookup")
 @click.option("--compare", is_flag=True, help="Show only summary comparison table")
 @click.option("--url", default=None, help="Custom probe URL (creates a generic provider)")
-@click.option("--repeat", default=1, help="Number of measurement rounds", show_default=True)
-@click.option("--interval", default=60, help="Seconds between rounds (used with --repeat)", show_default=True)
+@click.option("--repeat", default=1, type=click.IntRange(min=1), help="Number of measurement rounds", show_default=True)
+@click.option("--interval", default=60, type=click.IntRange(min=0), help="Seconds between rounds (used with --repeat)", show_default=True)
 @click.version_option(version=__version__)
 def main(
     providers: str,
@@ -50,6 +58,7 @@ def main(
     ipv6_only: bool,
     trace: bool,
     max_hops: int,
+    concurrency: int,
     json_output: bool,
     csv_output: bool,
     output: str | None,
@@ -66,6 +75,9 @@ def main(
     Measures latency to CDN Points of Presence with per-phase timing
     breakdown (DNS, TCP, TLS, TTFB, Transfer) and network path tracing with ASN info.
     """
+    if ipv4_only and ipv6_only:
+        raise click.UsageError("--ipv4-only and --ipv6-only are mutually exclusive")
+
     # Check for proxy warnings
     if not quiet and not json_output and not csv_output:
         for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
@@ -85,6 +97,7 @@ def main(
         ipv6_only=ipv6_only,
         trace_enabled=trace,
         max_hops=max_hops,
+        concurrency=concurrency,
         verbose=verbose,
         quiet=quiet,
         no_geo=no_geo,
@@ -139,10 +152,15 @@ async def _run(config: MeasurementConfig, custom_url: str | None = None) -> Full
     else:
         slugs = available
 
-    # Start geolocation in background
-    geo_task = None
+    # Geolocate before measuring so the lookup's own HTTP traffic can't
+    # contend with latency samples.  Capped so a slow geo API chain never
+    # stalls the run.
+    geo = None
     if not config.no_geo:
-        geo_task = asyncio.create_task(get_geolocation())
+        try:
+            geo = await asyncio.wait_for(get_geolocation(), timeout=8.0)
+        except Exception:
+            geo = None
 
     # Set up progress tracking (only track actual samples, not warmup)
     all_slugs = list(slugs)
@@ -204,19 +222,11 @@ async def _run(config: MeasurementConfig, custom_url: str | None = None) -> Full
                 if pr.provider_slug in paths:
                     pr.network_path = paths[pr.provider_slug]
 
-    # Collect geolocation
-    geo = None
-    if geo_task:
-        try:
-            geo = await geo_task
-        except Exception:
-            geo = None
-
     return FullResult(
         geo=geo,
         providers=provider_results,
         config=config,
-        timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
+        timestamp=datetime.datetime.now(datetime.timezone.utc).isoformat(),
     )
 
 

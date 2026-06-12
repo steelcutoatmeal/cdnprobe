@@ -14,7 +14,7 @@ A Python CLI tool that measures latency to CDN Points of Presence with granular 
 - **User geolocation** — Shows your IP, location, ISP, and distance to each detected PoP
 - **Multiple output formats** — Rich terminal tables, JSON (with timestamp), CSV (with timestamp and transfer stats)
 - **Network path tracing** — Traceroute to each CDN with ASN ownership via Team Cymru DNS lookups
-- **Concurrent measurement** — All providers measured in parallel; samples run sequentially per provider with fresh connections
+- **Capped concurrency** — Providers are measured a few at a time (default 4, tunable via `--concurrency`) so simultaneous probes don't contend for bandwidth and skew the latency being measured; samples run sequentially per provider with fresh connections
 
 ## Installation
 
@@ -87,6 +87,7 @@ Options:
   -6, --ipv6-only        Force IPv6
   --trace / --no-trace   Enable/disable network path tracing [default: trace]
   --max-hops INTEGER     Max hops for traceroute [default: 30]
+  -c, --concurrency INT  Providers measured at the same time [default: 4]
   --json                 Output JSON to stdout
   --csv                  Output CSV to stdout
   -o, --output FILE      Write results to file
@@ -245,8 +246,9 @@ Results are cached per-IP to avoid duplicate lookups when multiple providers sha
 
 ### Concurrency Model
 
-- **Inter-provider**: All providers run concurrently via `asyncio.gather()`
+- **Inter-provider**: Providers run concurrently, capped at `--concurrency` (default 4) at a time. The cap is deliberate: fully parallel probes contend for the uplink and skew the latency being measured. Raise it to trade accuracy for speed, or use `--concurrency 1` for fully serial measurement
 - **Intra-provider**: Samples run sequentially with configurable delay (default 100ms)
+- **Geolocation**: Resolved before sampling starts (capped at 8s) so its HTTP traffic can't interfere with latency samples
 - **Traceroute**: Runs concurrently for all providers after latency sampling completes
 - **ASN/rDNS**: All hop lookups run concurrently within each trace
 

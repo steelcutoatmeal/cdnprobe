@@ -26,8 +26,8 @@ def compute_stats(values: Sequence[float]) -> LatencyStats:
     jitter = _compute_jitter(values)
 
     return LatencyStats(
-        min=sorted_vals[0],
-        max=sorted_vals[-1],
+        min=round(sorted_vals[0], 2),
+        max=round(sorted_vals[-1], 2),
         avg=round(avg, 2),
         median=round(median, 2),
         p95=round(p95, 2),

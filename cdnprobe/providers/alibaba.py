@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import re
-
 import httpx
 
 from cdnprobe.models import PoPIdentity
@@ -37,14 +35,8 @@ class AlibabaProvider(CDNProvider):
         via = response.headers.get("via", "")
         if via:
             # Alibaba CDN via headers contain cache node IDs like
-            # "ens-cache29.l2us4[231,230,404-1280,M]" where "us4"
-            # indicates the region.
-            match = re.search(r"ens-cache\d+\.l2?([a-z]{2}\d+)", via, re.IGNORECASE)
-            if match:
-                return PoPIdentity(
-                    confidence="inferred",
-                    raw_header=via,
-                )
+            # "ens-cache29.l2us4[...]" but the region token is not a
+            # standard IATA code, so only the raw header is recorded.
             return PoPIdentity(
                 confidence="inferred",
                 raw_header=via,

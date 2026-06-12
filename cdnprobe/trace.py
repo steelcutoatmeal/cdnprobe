@@ -21,6 +21,7 @@ import dns.asyncresolver
 import dns.reversename
 
 from cdnprobe.config import (
+    CYMRU_ORIGIN6_ZONE,
     CYMRU_ORIGIN_ZONE,
     CYMRU_PEER_ZONE,
     TRACE_HOP_TIMEOUT,
@@ -41,12 +42,20 @@ _asn_cache: dict[str, dict] = {}
 # ASN lookup helpers (Team Cymru DNS)
 # ---------------------------------------------------------------------------
 
-def _reverse_ip(ip: str) -> str:
-    """Reverse the octets of an IPv4 address for DNS queries.
+def _cymru_origin_qname(ip: str) -> str:
+    """Build the Team Cymru origin query name for an IPv4 or IPv6 address.
 
-    Example: '8.8.8.8' -> '8.8.8.8'  (already reversed order for Cymru)
+    IPv4: reversed octets under origin.asn.cymru.com
+          ('8.8.8.8' -> '8.8.8.8.origin.asn.cymru.com')
+    IPv6: reversed nibbles of the exploded address under
+          origin6.asn.cymru.com (same format as ip6.arpa).
     """
-    return ".".join(reversed(ip.split(".")))
+    addr = ipaddress.ip_address(ip)
+    if addr.version == 6:
+        nibbles = addr.exploded.replace(":", "")
+        return ".".join(reversed(nibbles)) + f".{CYMRU_ORIGIN6_ZONE}"
+    reversed_ip = ".".join(reversed(ip.split(".")))
+    return f"{reversed_ip}.{CYMRU_ORIGIN_ZONE}"
 
 
 def clear_asn_cache() -> None:
@@ -62,8 +71,7 @@ async def _cymru_origin_lookup(
 
     Returns a dict with keys: asn, prefix, country (or empty on failure).
     """
-    reversed_ip = _reverse_ip(ip)
-    qname = f"{reversed_ip}.{CYMRU_ORIGIN_ZONE}"
+    qname = _cymru_origin_qname(ip)
     try:
         answers = await resolver.resolve(qname, "TXT")
         # First TXT record, strip surrounding quotes

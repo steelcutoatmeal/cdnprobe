@@ -3,11 +3,35 @@
 from __future__ import annotations
 
 import abc
+import re
 from typing import Optional
 
 import httpx
 
 from cdnprobe.models import PoPIdentity
+
+# Three-letter uppercase tokens that show up in cache/status headers but
+# are never PoP airport codes.  Without this filter, "x-cache: HIT" would
+# be reported as the IATA code "HIT".
+_NON_POP_TOKENS = {
+    "HIT", "TCP", "UDP", "MEM", "RAM", "SSL", "TLS",
+    "GET", "PUT", "VIA", "AGE", "CDN", "WAF", "BOT", "OFF",
+}
+
+_IATA_TOKEN_RE = re.compile(r"\b([A-Z]{3})\b")
+
+
+def find_iata_token(text: str) -> Optional[str]:
+    """Return the first 3-letter uppercase token that looks like a PoP code.
+
+    Skips well-known cache-status words (HIT, TCP, ...) so generic header
+    scraping doesn't produce false-positive PoP codes.
+    """
+    for match in _IATA_TOKEN_RE.finditer(text):
+        token = match.group(1)
+        if token not in _NON_POP_TOKENS:
+            return token
+    return None
 
 
 class CDNProvider(abc.ABC):

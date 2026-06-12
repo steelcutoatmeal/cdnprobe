@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import re
-
 import httpx
 
 from cdnprobe.models import PoPIdentity
@@ -31,16 +29,11 @@ class KingsoftProvider(CDNProvider):
         return "https://fe.ksyun.com/favicon.ico"
 
     def detect_pop(self, response: httpx.Response) -> PoPIdentity:
-        # X-Cache-Status contains PoP node: "MISS from KS-CLOUD-XG-FOREIGN-12-01"
+        # X-Cache-Status contains PoP node: "MISS from KS-CLOUD-XG-FOREIGN-12-01".
+        # The node name is not an IATA code, so it is kept in raw_header
+        # rather than reported as a PoP code.
         cache_status = response.headers.get("x-cache-status", "")
         if cache_status:
-            match = re.search(r"KS-CLOUD-([A-Za-z0-9-]+)", cache_status)
-            if match:
-                return PoPIdentity(
-                    code=match.group(1),
-                    confidence="inferred",
-                    raw_header=cache_status,
-                )
             return PoPIdentity(confidence="inferred", raw_header=cache_status)
         cdn_req = response.headers.get("x-cdn-request-id", "")
         if cdn_req:

@@ -31,6 +31,7 @@ import h2.events
 import httpx
 
 from cdnprobe.config import USER_AGENT
+from cdnprobe.iata import enrich_pop
 from cdnprobe.models import (
     MeasurementConfig,
     PoPIdentity,
@@ -144,7 +145,7 @@ async def _measure_tcp(
 # TLS upgrade
 # ---------------------------------------------------------------------------
 
-def _build_ssl_context(hostname: str) -> ssl.SSLContext:
+def _build_ssl_context() -> ssl.SSLContext:
     """Build a standard SSL context that validates the server certificate."""
     ctx = ssl.create_default_context()
     ctx.set_alpn_protocols(["h2", "http/1.1"])
@@ -164,7 +165,7 @@ async def _measure_tls(
     If ``start_tls`` is not available on the writer's transport, the
     caller should fall back to the combined TCP+TLS measurement path.
     """
-    ctx = _build_ssl_context(hostname)
+    ctx = _build_ssl_context()
 
     t0 = time.perf_counter()
     transport = writer.transport
@@ -238,7 +239,7 @@ async def _measure_tcp_tls_combined(
     Returns (reader, writer, tls_ms, tls_version).  The caller owns the
     connection and is responsible for closing it.
     """
-    ctx = _build_ssl_context(hostname)
+    ctx = _build_ssl_context()
 
     t0 = time.perf_counter()
     reader, writer = await asyncio.wait_for(
@@ -333,8 +334,6 @@ async def _measure_http_h2(
                 conn.acknowledge_received_data(
                     event.flow_controlled_length, event.stream_id,
                 )
-                writer.write(conn.data_to_send())
-                await writer.drain()
 
             elif isinstance(event, h2.events.StreamEnded):
                 stream_ended = True
@@ -343,6 +342,14 @@ async def _measure_http_h2(
                 raise ConnectionError(
                     f"HTTP/2 stream reset: error code {event.error_code}"
                 )
+
+        # Flush any frames h2 queued while processing events (flow-control
+        # WINDOW_UPDATEs, PING/SETTINGS ACKs) — even when no DATA arrived,
+        # otherwise unacknowledged control frames can stall the connection.
+        outbound = conn.data_to_send()
+        if outbound:
+            writer.write(outbound)
+            await writer.drain()
 
     if t_first_byte is None:
         t_first_byte = time.perf_counter()
@@ -433,6 +440,7 @@ async def _measure_http_h1(
     content_length = response_headers.get("content-length")
     transfer_encoding = response_headers.get("transfer-encoding", "").lower()
 
+    t_done: float | None = None
     if transfer_encoding == "chunked":
         body = await _read_chunked_body(reader, body_so_far, timeout)
     elif content_length is not None:
@@ -446,19 +454,27 @@ async def _measure_http_h1(
             remaining -= len(chunk)
         body = b"".join(body_parts)
     else:
-        # Read until EOF (Connection: close)
+        # Read until EOF (Connection: close).  A server that ignores
+        # "Connection: close" leaves the socket open until our read times
+        # out — clock transfer at the last byte received so that idle wait
+        # is not counted as transfer time.
         body_parts = [body_so_far]
+        t_last_data = t_first_byte
         while True:
             try:
                 chunk = await asyncio.wait_for(reader.read(65535), timeout=timeout)
                 if not chunk:
+                    t_last_data = time.perf_counter()
                     break
                 body_parts.append(chunk)
+                t_last_data = time.perf_counter()
             except (asyncio.TimeoutError, ConnectionError):
                 break
         body = b"".join(body_parts)
+        t_done = t_last_data
 
-    t_done = time.perf_counter()
+    if t_done is None:
+        t_done = time.perf_counter()
     transfer_ms = (t_done - t_first_byte) * 1000.0
 
     result = HttpResult(
@@ -694,13 +710,13 @@ async def _run_single_sample(
             status_code = http_result.status_code
             http_version = http_result.http_version
 
-            # Warn on redirects — timing reflects the redirect response,
-            # not the final destination.  Probe URLs should avoid redirects.
+            # Redirects mean timing reflects the redirect response, not the
+            # final destination.  A user-visible warning is attached to the
+            # provider result in measure_provider; log the target here.
             if status_code and 300 <= status_code < 400:
                 location = http_result.headers.get("location") or "unknown"
-                logger.warning(
-                    "%s probe URL returned %d redirect to %s — "
-                    "timing may not reflect actual CDN edge latency",
+                logger.debug(
+                    "%s probe URL returned %d redirect to %s",
                     provider.slug, status_code, location,
                 )
 
@@ -765,22 +781,56 @@ def _safe_close_writer(writer: asyncio.StreamWriter | None) -> None:
 # Rate-limit backoff
 # ---------------------------------------------------------------------------
 
+# Wall-clock backstop per sample: a sample runs up to four sequential
+# phases (DNS, TCP, TLS, HTTP) that are each individually bounded by
+# config.timeout, so the budget scales with the number of phases plus
+# fixed slack.  Sized so it cannot fire on a legitimately
+# slow-but-progressing sample.
+_SAMPLE_BUDGET_PHASES = 4
+_SAMPLE_BUDGET_SLACK_S = 5.0
+
+
+async def _run_capped_sample(
+    provider: CDNProvider,
+    sample_index: int,
+    config: MeasurementConfig,
+) -> SampleResult:
+    """Run a single sample with an overall wall-clock budget.
+
+    The budget is a backstop against pathological servers that trickle
+    data forever (the HTTP phase may span several reads, each bounded by
+    ``config.timeout`` but unbounded in aggregate).
+    """
+    budget = config.timeout * _SAMPLE_BUDGET_PHASES + _SAMPLE_BUDGET_SLACK_S
+    try:
+        return await asyncio.wait_for(
+            _run_single_sample(provider, sample_index, config),
+            timeout=budget,
+        )
+    except asyncio.TimeoutError:
+        return SampleResult(
+            sample_index=sample_index,
+            timing=TimingBreakdown(),
+            error="Overall sample timeout exceeded",
+        )
+
+
 async def _run_sample_with_backoff(
     provider: CDNProvider,
     sample_index: int,
     config: MeasurementConfig,
 ) -> SampleResult:
-    """Run a single sample, retrying once on HTTP 429 with exponential backoff."""
-    result = await _run_single_sample(provider, sample_index, config)
+    """Run a single sample, retrying once on HTTP 429 with backoff."""
+    result = await _run_capped_sample(provider, sample_index, config)
     if result.status_code == 429:
         backoff_s = 2.0
-        logger.info(
+        logger.debug(
             "Rate-limited (429) by %s, backing off %.1fs before retry",
             provider.slug,
             backoff_s,
         )
         await asyncio.sleep(backoff_s)
-        result = await _run_single_sample(provider, sample_index, config)
+        result = await _run_capped_sample(provider, sample_index, config)
     return result
 
 
@@ -825,17 +875,16 @@ async def measure_provider(
         if progress_callback and not is_warmup:
             progress_callback(provider.slug, sample_idx, config.samples, None)
 
-        try:
-            sample = await asyncio.wait_for(
-                _run_sample_with_backoff(provider, sample_idx, config),
-                timeout=config.timeout + 5.0,  # generous outer timeout
+        sample = await _run_sample_with_backoff(provider, sample_idx, config)
+
+        # Surface redirect responses as a user-visible warning (once).
+        if sample.status_code and 300 <= sample.status_code < 400:
+            msg = (
+                f"Probe URL returned HTTP {sample.status_code} redirect — "
+                "timing reflects the redirect response, not the final destination"
             )
-        except asyncio.TimeoutError:
-            sample = SampleResult(
-                sample_index=sample_idx,
-                timing=TimingBreakdown(),
-                error="Overall sample timeout exceeded",
-            )
+            if msg not in result.warnings:
+                result.warnings.append(msg)
 
         if not is_warmup:
             result.samples.append(sample)
@@ -865,6 +914,10 @@ async def measure_provider(
         result.extra_metadata = metadata
     except Exception as exc:
         logger.debug("PoP detection failed for %s: %s", provider.slug, exc)
+
+    # Fill in city/country/lat/lon from the IATA database so that both
+    # terminal rendering and JSON/CSV exports see the same enriched PoP.
+    enrich_pop(result.pop)
 
     # Aggregate phase statistics.
     aggregate_provider_stats(result)
@@ -925,15 +978,6 @@ async def _detect_pop_and_metadata(
 
     metadata = provider.extract_metadata(response)
 
-    # Propagate cache status into result if not already set.
-    for sample in result.samples:
-        if sample.cache_status is None:
-            for hdr in ("x-cache", "cf-cache-status", "x-cache-status", "x-cdn-cache"):
-                val = response.headers.get(hdr)
-                if val:
-                    sample.cache_status = val
-                    break
-
     return pop, metadata
 
 
@@ -948,8 +992,10 @@ async def measure_all(
     """Run measurements for all configured providers concurrently.
 
     If ``config.providers`` is empty, every registered provider is measured.
-    Providers are measured concurrently via ``asyncio.gather``; within each
-    provider, samples run sequentially.
+    Providers are measured concurrently, capped at ``config.concurrency``
+    at a time so simultaneous probes don't contend for bandwidth and skew
+    the latency being measured; within each provider, samples run
+    sequentially.
 
     Parameters
     ----------
@@ -986,10 +1032,13 @@ async def measure_all(
                 )
             )
 
+    semaphore = asyncio.Semaphore(max(1, config.concurrency))
+
     async def _safe_measure(p: CDNProvider) -> ProviderResult:
         """Wrapper that catches unexpected fatal errors per provider."""
         try:
-            return await measure_provider(p, config, progress_callback)
+            async with semaphore:
+                return await measure_provider(p, config, progress_callback)
         except Exception as exc:
             logger.exception("Fatal error measuring %s", p.slug)
             return ProviderResult(

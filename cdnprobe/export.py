@@ -5,8 +5,6 @@ from __future__ import annotations
 import csv
 import io
 import json
-from dataclasses import asdict
-from typing import Optional
 
 from cdnprobe.models import FullResult, ProviderResult
 
@@ -170,6 +168,7 @@ def _provider_to_dict(pr: ProviderResult) -> dict:
         "tls_version": pr.tls_version,
         "http_version": pr.http_version,
         "error": pr.error,
+        "warnings": pr.warnings,
         "pop": {
             "code": pr.pop.code,
             "city": pr.pop.city,

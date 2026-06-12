@@ -16,6 +16,11 @@ dependencies = [
     "icmplib>=3.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
 [project.scripts]
 cdnprobe = "cdnprobe.cli:main"
 

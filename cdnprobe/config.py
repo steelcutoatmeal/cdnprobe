@@ -21,6 +21,10 @@ DEFAULT_WARMUP = 1
 DEFAULT_DELAY_MS = 100
 DEFAULT_TIMEOUT = 10.0
 DEFAULT_MAX_HOPS = 30
+# Providers measured at the same time.  Kept low on purpose: fully
+# parallel probes contend for the uplink and skew the latency being
+# measured.  Raise with --concurrency to trade accuracy for speed.
+DEFAULT_CONCURRENCY = 4
 
 # Traceroute settings
 TRACE_PROBES_PER_HOP = 3
@@ -28,6 +32,7 @@ TRACE_HOP_TIMEOUT = 2.0
 
 # ASN lookup DNS zones
 CYMRU_ORIGIN_ZONE = "origin.asn.cymru.com"
+CYMRU_ORIGIN6_ZONE = "origin6.asn.cymru.com"
 CYMRU_PEER_ZONE = "peer.asn.cymru.com"
 
 # Geolocation API fallback chain

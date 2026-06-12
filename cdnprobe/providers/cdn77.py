@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import re
-
 import httpx
 
 from cdnprobe.models import PoPIdentity
-from cdnprobe.providers.base import CDNProvider
+from cdnprobe.providers.base import CDNProvider, find_iata_token
 
 
 class CDN77Provider(CDNProvider):
@@ -43,10 +41,10 @@ class CDN77Provider(CDNProvider):
 
         x_cache = response.headers.get("x-cache", "")
         if x_cache:
-            match = re.search(r"\b([A-Z]{3})\b", x_cache)
-            if match:
+            code = find_iata_token(x_cache)
+            if code:
                 return PoPIdentity(
-                    code=match.group(1),
+                    code=code,
                     confidence="inferred",
                     raw_header=x_cache,
                 )

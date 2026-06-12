@@ -125,6 +125,7 @@ class ProviderResult:
     http_version: Optional[str] = None
     error: Optional[str] = None  # Fatal error for entire provider
     extra_metadata: dict[str, str] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
 
     @property
     def successful_samples(self) -> list[SampleResult]:
@@ -160,6 +161,7 @@ class MeasurementConfig:
     warmup: int = 1
     delay_ms: int = 100
     timeout: float = 10.0
+    concurrency: int = 4
     dns_server: Optional[str] = None
     ipv4_only: bool = False
     ipv6_only: bool = False

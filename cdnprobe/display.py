@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import json
-import os
-from pathlib import Path
 from typing import Optional
 
 from rich.console import Console
@@ -16,7 +13,6 @@ from cdnprobe.config import PHASE_LABELS, PHASE_NAMES, PHASE_THRESHOLDS
 from cdnprobe.models import (
     FullResult,
     GeoLocation,
-    HopInfo,
     LatencyStats,
     NetworkPath,
     ProviderResult,
@@ -24,20 +20,9 @@ from cdnprobe.models import (
 
 console = Console()
 
-# IATA lookup loaded lazily
-_iata_db: dict | None = None
-
-
-def _load_iata() -> dict:
-    global _iata_db
-    if _iata_db is None:
-        path = Path(__file__).parent / "data" / "iata_codes.json"
-        try:
-            with open(path) as f:
-                _iata_db = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            _iata_db = {}
-    return _iata_db
+# Bar-chart glyphs (full block / light shade)
+_BAR_FILLED = "█"
+_BAR_EMPTY = "░"
 
 
 def _color_for_ms(value: float, phase: str = "total") -> str:
@@ -106,7 +91,7 @@ class ProgressTracker:
             status = self.status[slug]
             bar_width = 15
             filled = int((completed / self.total_samples) * bar_width) if self.total_samples > 0 else 0
-            bar = "[green]" + "\u2588" * filled + "[/green]" + "[dim]\u2591[/dim]" * (bar_width - filled)
+            bar = "[green]" + _BAR_FILLED * filled + "[/green]" + f"[dim]{_BAR_EMPTY}[/dim]" * (bar_width - filled)
             progress_text = f"{bar} {completed}/{self.total_samples}"
 
             style = "green" if status == "done" else ("red" if status == "error" else "yellow")
@@ -142,21 +127,9 @@ def _render_provider_header(result: ProviderResult, geo: Optional[GeoLocation] =
 
     pop = result.pop
     if pop.code:
-        iata_db = _load_iata()
-        iata_info = iata_db.get(pop.code.upper(), {})
-        city = pop.city or iata_info.get("city", "")
-        country = pop.country or iata_info.get("country", "")
-
-        if pop.lat is None and "lat" in iata_info:
-            pop.lat = iata_info["lat"]
-        if pop.lon is None and "lon" in iata_info:
-            pop.lon = iata_info["lon"]
-        if not pop.city and city:
-            pop.city = city
-        if not pop.country and country:
-            pop.country = country
-
-        loc_str = ", ".join(p for p in [city, country] if p)
+        # PoP city/country/lat/lon are enriched from the IATA database in
+        # the measurement pipeline (engine.measure_provider), not here.
+        loc_str = ", ".join(p for p in [pop.city, pop.country] if p)
         pop_text = f"PoP: [bold]{pop.code}[/bold]"
         if loc_str:
             pop_text += f" ({loc_str})"
@@ -352,6 +325,9 @@ def _render_provider(
     """Print the complete output for one provider."""
     _render_provider_header(result, geo)
 
+    for warning in result.warnings:
+        console.print(f"  [yellow]⚠ {warning}[/yellow]")
+
     if not result.phase_stats:
         console.print("[dim italic]  No successful samples[/dim italic]")
     else:
@@ -437,7 +413,12 @@ def render_comparison(results: list[ProviderResult]) -> None:
         filled = int((total_median / max_total) * bar_width) if max_total > 0 else 0
         filled = min(filled, bar_width)
         color = _color_for_ms(total_median, "total")
-        bar = f"[{color}]{'\u2588' * filled}[/{color}][bright_black]{'\u2591' * (bar_width - filled)}[/bright_black]"
+        # NOTE: keep the glyphs out of the f-string expressions \u2014 backslash
+        # escapes inside f-string expressions are a SyntaxError before 3.12.
+        bar = (
+            f"[{color}]{_BAR_FILLED * filled}[/{color}]"
+            f"[bright_black]{_BAR_EMPTY * (bar_width - filled)}[/bright_black]"
+        )
 
         table.add_row(
             str(rank),
